@@ -15,6 +15,8 @@
 extern sai_object_id_t gVirtualRouterId;
 extern MacAddress gMacAddress;
 
+#define RIF_STAT_COUNTER_FLEX_COUNTER_GROUP "RIF_STAT_COUNTER"
+
 struct IntfsEntry
 {
     std::set<IpPrefix>  ip_addresses;
@@ -35,10 +37,23 @@ public:
 
     bool setRouterIntfsMtu(Port &port);
     std::set<IpPrefix> getSubnetRoutes();
+
+    void addRifToFlexCounter(const Port& port);
+    void removeRifToFlexCounter(const Port& port);
+
 private:
     VRFOrch *m_vrfOrch;
     IntfsTable m_syncdIntfses;
     void doTask(Consumer &consumer);
+
+    shared_ptr<DBConnector> m_counter_db;
+    shared_ptr<DBConnector> m_flex_db;
+    unique_ptr<Table> m_rifNameTable;
+    unique_ptr<Table> m_rifTypeTable;
+    unique_ptr<ProducerTable> m_flexCounterTable;
+    unique_ptr<ProducerTable> m_flexCounterGroupTable;
+
+    std::string getRifFlexCounterTableKey(std::string s);
 
     int getRouterIntfsRefCount(const string&);
 

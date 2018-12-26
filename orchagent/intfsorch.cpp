@@ -4,6 +4,7 @@
 #include <map>
 #include <net/if.h>
 
+#include "sai_serialize.h"
 #include "intfsorch.h"
 #include "ipprefix.h"
 #include "logger.h"
@@ -30,10 +31,41 @@ extern BufferOrch *gBufferOrch;
 
 const int intfsorch_pri = 35;
 
+#define RIF_FLEX_STAT_COUNTER_POLL_MSECS "1000"
+
+static const vector<sai_router_interface_stat_t> rifStatIds =
+{
+    SAI_ROUTER_INTERFACE_STAT_IN_PACKETS,
+    SAI_ROUTER_INTERFACE_STAT_IN_OCTETS,
+    SAI_ROUTER_INTERFACE_STAT_IN_ERROR_PACKETS,
+    SAI_ROUTER_INTERFACE_STAT_IN_ERROR_OCTETS,
+    SAI_ROUTER_INTERFACE_STAT_OUT_PACKETS,
+    SAI_ROUTER_INTERFACE_STAT_OUT_OCTETS,
+    SAI_ROUTER_INTERFACE_STAT_OUT_ERROR_PACKETS,
+    SAI_ROUTER_INTERFACE_STAT_OUT_ERROR_OCTETS,
+};
+
 IntfsOrch::IntfsOrch(DBConnector *db, string tableName, VRFOrch *vrf_orch) :
         Orch(db, tableName, intfsorch_pri), m_vrfOrch(vrf_orch)
 {
     SWSS_LOG_ENTER();
+
+    /* Initialize DB connectors */ 
+    m_counter_db = shared_ptr<DBConnector>(new DBConnector(COUNTERS_DB, DBConnector::DEFAULT_UNIXSOCKET, 0));
+    m_flex_db = shared_ptr<DBConnector>(new DBConnector(FLEX_COUNTER_DB, DBConnector::DEFAULT_UNIXSOCKET, 0));
+
+    /* Initialize COUNTER_DB tables */
+    m_rifNameTable = unique_ptr<Table>(new Table(m_counter_db.get(), COUNTERS_RIF_NAME_MAP));
+    m_rifTypeTable = unique_ptr<Table>(new Table(m_counter_db.get(), COUNTERS_RIF_TYPE_MAP));
+
+    /* Initialize FLEX_COUNTER_DB tables */
+    m_flexCounterTable = unique_ptr<ProducerTable>(new ProducerTable(m_flex_db.get(), FLEX_COUNTER_TABLE));
+    m_flexCounterGroupTable = unique_ptr<ProducerTable>(new ProducerTable(m_flex_db.get(), FLEX_COUNTER_GROUP_TABLE));
+
+    vector<FieldValueTuple> fieldValues;
+    fieldValues.emplace_back(POLL_INTERVAL_FIELD, RIF_FLEX_STAT_COUNTER_POLL_MSECS);
+    fieldValues.emplace_back(STATS_MODE_FIELD, STATS_MODE_READ);
+    m_flexCounterGroupTable->set(RIF_STAT_COUNTER_FLEX_COUNTER_GROUP, fieldValues);
 }
 
 sai_object_id_t IntfsOrch::getRouterIntfsId(const string &alias)
@@ -431,6 +463,7 @@ bool IntfsOrch::addRouterIntfs(sai_object_id_t vrf_id, Port &port)
     port.m_vr_id = vrf_id;
 
     gPortsOrch->setPort(port.m_alias, port);
+    addRifToFlexCounter(port);
 
     SWSS_LOG_NOTICE("Create router interface %s MTU %u", port.m_alias.c_str(), port.m_mtu);
 
@@ -457,6 +490,7 @@ bool IntfsOrch::removeRouterIntfs(Port &port)
     port.m_rif_id = 0;
     port.m_vr_id = 0;
     gPortsOrch->setPort(port.m_alias, port);
+    removeRifToFlexCounter(port);
 
     SWSS_LOG_NOTICE("Remove router interface for port %s", port.m_alias.c_str());
 
@@ -651,4 +685,78 @@ void IntfsOrch::removeDirectedBroadcast(const Port &port, const IpAddress &ip_ad
     }
 
     SWSS_LOG_NOTICE("Remove broadcast route ip:%s", ip_addr.to_string().c_str());
+}
+
+void IntfsOrch::addRifToFlexCounter(const Port& port)
+{
+    SWSS_LOG_ENTER();
+    /* update RIF maps in COUNTERS_DB */
+    vector<FieldValueTuple> rifNameVector;
+    vector<FieldValueTuple> rifTypeVector;
+
+    const auto id = sai_serialize_object_id(port.m_rif_id);
+    const auto name = port.m_alias;
+
+    std::string type = "";
+    switch(port.m_type)
+    {
+        case Port::PHY:
+        case Port::LAG:
+            type = "SAI_ROUTER_INTERFACE_TYPE_PORT";
+            break;
+        case Port::VLAN:
+            type = "SAI_ROUTER_INTERFACE_TYPE_VLAN";
+            break;
+        default:
+            SWSS_LOG_ERROR("Unsupported port type: %d", port.m_type);
+            break;
+    }
+
+    rifNameVector.emplace_back(name, id);
+    rifTypeVector.emplace_back(id, type);
+
+    m_rifNameTable->set("", rifNameVector);
+    m_rifTypeTable->set("", rifTypeVector);
+
+    /* update RIF in FLEX_COUNTER_DB */
+    string key = getRifFlexCounterTableKey(id);
+
+    std::string delimiter = "";
+    std::ostringstream counters_stream;
+    for (const auto& it: rifStatIds)
+    {
+        counters_stream << delimiter << sai_serialize_router_interface_stat(it);
+        delimiter = comma;
+    }
+
+    vector<FieldValueTuple> fieldValues;
+    fieldValues.emplace_back(RIF_COUNTER_ID_LIST, counters_stream.str());
+
+    m_flexCounterTable->set(key, fieldValues);
+    SWSS_LOG_DEBUG("Registered interface %s to Flex counter", port.m_alias.c_str());
+}
+
+void IntfsOrch::removeRifToFlexCounter(const Port& port)
+{
+    SWSS_LOG_ENTER();
+    /* remove it from COUNTERS_DB maps */
+    const auto id = sai_serialize_object_id(port.m_rif_id);
+    const auto name = port.m_alias;
+
+    m_rifNameTable->hdel("", name);
+    m_rifTypeTable->hdel("", id);
+
+    /* remove it from FLEX_COUNTER_DB */
+    string key = getRifFlexCounterTableKey(id);
+
+    vector<FieldValueTuple> fieldValues;
+    fieldValues.emplace_back(RIF_COUNTER_ID_LIST, "");
+
+    m_flexCounterTable->set(key, fieldValues);
+    SWSS_LOG_DEBUG("Unregistered interface %s from Flex counter", port.m_alias.c_str());
+}
+
+string IntfsOrch::getRifFlexCounterTableKey(string key)
+{
+    return string(RIF_STAT_COUNTER_FLEX_COUNTER_GROUP) + ":" + key;
 }
